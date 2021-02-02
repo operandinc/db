@@ -26,18 +26,109 @@ type DB struct {
 	Writes    map[string][]TSVal
 	Deletes   map[string][]int64
 	Timestamp int64
+	ActiveTx  uint
+	Closed    bool
 }
 
 func (db *DB) Now() int64 {
 	return time.Now().UnixNano()
 }
 
-var ErrKeyNotFound = errors.New("db: key not found")
+var (
+	ErrKeyNotFound = errors.New("db: key not found")
+	ErrTxClosed    = errors.New("db: tx closed")
+)
+
+// Returns the latest write from db.Writes up until ts. If ts == nil, then the
+// latest write is returned. If there are no writes, then (nil, 0) is returned.
+// Requires lock to be held.
+func (db *DB) GetLatestWriteUntilTS(k string, ts *int64) (v []byte, wts int64) {
+	if wrs, ok := db.Writes[k]; ok {
+		l := len(wrs)
+		if l == 0 {
+			return
+		}
+		if ts == nil {
+			// Fast path, ts == nil.
+			v = wrs[l-1].Value
+			wts = wrs[l-1].Ts
+		} else {
+			// Return the last write before ts.
+			for i := 0; i < len(wrs); i++ {
+				if i != len(wrs)-1 && wrs[i+1].Ts < *ts {
+					continue
+				}
+				if wrs[i].Ts < *ts {
+					v = wrs[i].Value
+					wts = wrs[i].Ts
+					break
+				}
+			}
+		}
+	}
+	return
+}
+
+// Returns the latest delete from db.Deletes up until ts. If ts == nil, then the
+// latest delete is returned. If there are no deletes, then nil is returned.
+// Requires lock to be held.
+func (db *DB) GetLatestDeleteUntilTS(k string, ts *int64) (dts *int64) {
+	if dels, ok := db.Deletes[k]; ok {
+		l := len(dels)
+		if l == 0 {
+			return
+		}
+		if ts == nil {
+			// Fast path, ts == nil.
+			dts = &dels[l-1]
+		} else {
+			// Return the last delete before ts.
+			for i := 0; i < len(dels); i++ {
+				if i != len(dels)-1 && dels[i+1] < *ts {
+					continue
+				}
+				if dels[i] < *ts {
+					dts = &dels[i]
+					break
+				}
+			}
+		}
+	}
+	return
+}
 
 func (db *DB) InternalGet(k string, ts *int64) ([]byte, error) {
 	db.Mutex.RLock()
 	defer db.Mutex.RUnlock()
-	// Base case - we are the root object.
+
+	// We are within a transaction.
+	if db.Closed {
+		return nil, ErrTxClosed
+	}
+
+	// Get the latest write up until `ts` of this transaction.
+	v, fts := db.GetLatestWriteUntilTS(k, ts)
+
+	// Make sure the key/value pair hasn't been deleted within this
+	// transaction. If it was deleted at a later timestamp than the
+	// latest write and before ts, then we can safely return.
+	if dts := db.GetLatestDeleteUntilTS(k, ts); dts != nil {
+		if *dts > fts {
+			return nil, ErrKeyNotFound
+		}
+	}
+
+	// If we have written to this key during this transaction, then this
+	// is the most up to date version and thus we must return it.
+	if v != nil {
+		return v, nil
+	}
+
+	// If we are in the parent object, then we try to fetch the key from the
+	// store as a last resort. Otherwise, we must fetch the key from the next
+	// level up using a recursive call. Note that we fetch the key at the
+	// timestamp of the start of this transaction, so writes after the
+	// transaction won't be counted.
 	if db.Parent == nil {
 		v, ok := db.Store[k]
 		if !ok {
@@ -45,40 +136,6 @@ func (db *DB) InternalGet(k string, ts *int64) ([]byte, error) {
 		}
 		return v, nil
 	}
-	// We are within a transaction.
-	var (
-		v   []byte // Value of the key from this transaction.
-		fts int64  // Timestamp of latest write (from current view).
-	)
-	// Get the latest write up until ts of this transaction.
-	if tsvs, ok := db.Writes[k]; ok && len(tsvs) > 0 {
-		// FIXME: Could iterate backward to speed this up.
-		for _, tsv := range tsvs {
-			if ts == nil || tsv.Ts >= *ts {
-				v = tsv.Value
-				fts = tsv.Ts
-			}
-		}
-	}
-	// Make sure the key/value pair hasn't been deleted within this
-	// transaction. If it was deleted at a later timestamp than the
-	// latest write and before ts, then we can safely return.
-	if dts, ok := db.Deletes[k]; ok && len(dts) > 0 {
-		for _, dt := range dts {
-			if dt > fts {
-				if ts == nil || dt <= *ts {
-					return nil, ErrKeyNotFound
-				}
-				break
-			}
-		}
-	}
-	// If we have written to this key during this transaction, then this
-	// is the most up to date version and thus we must return it.
-	if v != nil {
-		return v, nil
-	}
-	// If key wasn't mutated inside this transaction, must fetch from parent.
 	return db.Parent.InternalGet(k, &db.Timestamp)
 }
 
@@ -88,18 +145,21 @@ func (db *DB) Get(k string) ([]byte, error) {
 
 // Requires lock to be held.
 func (db *DB) InternalPut(k string, v []byte, ts *int64) error {
-	// If we are in the root object, then we just need to update the base.
-	if db.Parent == nil {
-		db.Store[k] = v
-		return nil
+	if db.Closed {
+		return ErrTxClosed
 	}
 	if ts == nil {
 		now := db.Now()
 		ts = &now
 	}
-	// We need to update our transaction state to include the new update
-	// for the key/value pair. This mutation gets appended to any existing
-	// mutations already executed within this transaction.
+	// If this is the root and there are no active transactions, then
+	// we don't need to use the db.Writes array and we can just go
+	// straight to the underlying storage mechanism.
+	if db.Parent == nil && db.ActiveTx == 0 {
+		db.Store[k] = v
+		return nil
+	}
+	// Record the new insertion at the timestamp.
 	db.Writes[k] = append(db.Writes[k], TSVal{Ts: *ts, Value: v})
 	return nil
 }
@@ -112,16 +172,21 @@ func (db *DB) Put(k string, v []byte) error {
 
 // Requires lock to be held.
 func (db *DB) InternalDelete(k string, ts *int64) error {
-	// If we are in the root object, then we just need to update the base.
-	if db.Parent == nil {
-		delete(db.Store, k)
-		return nil
+	if db.Closed {
+		return ErrTxClosed
 	}
 	if ts == nil {
 		now := db.Now()
 		ts = &now
 	}
-	// We need to update our transaction state to include the new deletion.
+	// If this is the root and there are no active transactions, then
+	// we don't need to use the db.Deletes array and we can just go
+	// straight to the underlying storage mechanism.
+	if db.Parent == nil && db.ActiveTx == 0 {
+		delete(db.Store, k)
+		return nil
+	}
+	// Record the new deletion at timestamp.
 	db.Deletes[k] = append(db.Deletes[k], *ts)
 	return nil
 }
@@ -133,11 +198,15 @@ func (db *DB) Delete(k string) error {
 }
 
 func (db *DB) TxBegin() KV {
+	db.Mutex.Lock()
+	defer db.Mutex.Unlock()
+	db.ActiveTx++
 	return &DB{
 		Parent:    db,
 		Writes:    make(map[string][]TSVal),
 		Deletes:   make(map[string][]int64),
 		Timestamp: db.Now(),
+		Closed:    false,
 	}
 }
 
@@ -146,6 +215,66 @@ var (
 	ErrInvalidParent = errors.New("db: invalid parent tx")
 	ErrConflict      = errors.New("db: conflicting timestamps")
 )
+
+// Creates a hashset of all the keys activally mutates as part of
+// db.Writes & db.Deletes. Requires an RLock to be held by the caller.
+func (db *DB) MutatedKeys() map[string]struct{} {
+	keys := make(map[string]struct{})
+	for k := range db.Writes {
+		keys[k] = struct{}{}
+	}
+	for k := range db.Deletes {
+		keys[k] = struct{}{}
+	}
+	return keys
+}
+
+// Fetches the last mutated state for a key. Requires that the k was mutated
+// and thus is a key in db.Writes or db.Deletes (or both). Returns the key value
+// and the timestamps of both the last write and last delete. Requires an RLock
+// to be held by the caller.
+func (db *DB) LatestMutatedState(k string) (v []byte, wts int64, dts int64) {
+	v, wts = db.GetLatestWriteUntilTS(k, nil)
+	if delts := db.GetLatestDeleteUntilTS(k, nil); delts != nil {
+		dts = *delts
+	}
+	return
+}
+
+// ClearMutations clears all the mutations from db.Writes and db.Deletes.
+// Requires the lock to be held by the caller.
+func (db *DB) ClearMutations() {
+	for k := range db.Writes {
+		delete(db.Writes, k)
+	}
+	for k := range db.Deletes {
+		delete(db.Deletes, k)
+	}
+}
+
+// Flushes the latest mutations from db.Writes & db.Deletes into db.Store.
+// This operation can only be performed as the parent. Requires lock to be held.
+func (db *DB) Flush() error {
+	// Flush only makes sense as a parent.
+	if db.Parent != nil {
+		return nil
+	}
+	// Fetch all the mutated keys.
+	keys := db.MutatedKeys()
+	// For each key, flush it to storage.
+	for k := range keys {
+		v, wts, dts := db.LatestMutatedState(k)
+		if dts > wts {
+			delete(db.Store, k)
+		} else if dts < wts {
+			db.Store[k] = v
+		} else {
+			return ErrConflict
+		}
+	}
+	db.ClearMutations()
+	return nil
+}
 
 func (db *DB) TxCommit(kv KV) error {
 	// Make sure that the type of the transaction matches ourselves.
@@ -165,14 +294,13 @@ func (db *DB) TxCommit(kv KV) error {
 		return ErrInvalidParent
 	}
 
+	// Make sure the transaction hasn't been previously committed.
+	if txdb.Closed {
+		return ErrTxClosed
+	}
+
 	// Construct a hashset of all the keys that were mutated.
-	keys := make(map[string]struct{})
-	for k := range txdb.Writes {
-		keys[k] = struct{}{}
-	}
-	for k := range txdb.Deletes {
-		keys[k] = struct{}{}
-	}
+	keys := txdb.MutatedKeys()
 
 	// At the point of committing a transaction, we essentially fast-forward all
 	// the writes to the current point in time, call it `ts`. This means that
@@ -188,42 +316,43 @@ func (db *DB) TxCommit(kv KV) error {
 	// commit that mutation to our store. Note that this is dependent on whether
 	// or not this object is itself a transaction or if it's the root.
 	for k := range keys {
-		var (
-			v       []byte // The value that the key was mutated to, can be nil.
-			writets int64  // The timestamp of latest write for key.
-			delts   int64  // The timestamp of latest delete for key.
-		)
-		if tsv, ok := txdb.Writes[k]; ok {
-			l := len(tsv)
-			if l > 0 {
-				v = tsv[l-1].Value
-				writets = tsv[l-1].Ts
-			}
-		}
-		if dts, ok := txdb.Deletes[k]; ok {
-			l := len(dts)
-			if l > 0 {
-				delts = dts[l-1]
-			}
-		}
-		if delts > writets {
+		v, wts, dts := txdb.LatestMutatedState(k)
+		if dts > wts {
 			// This is a delete.
 			db.InternalDelete(k, &ts)
-		} else if delts < writets {
+		} else if dts < wts {
 			// This is a write.
 			db.InternalPut(k, v, &ts)
 		} else {
-			// delts = writets meaning the key was written to and deleted
-			// at the same time, we cannot resolve this thus should return
-			// an error to the caller.
 			return ErrConflict
 		}
 	}
+
+	// Now that the transaction has been committed, we mark it as closed
+	// and thus it cannot be used for any subsequent operations. This ensures
+	// that our ActiveTx count remains accurate (since it would be messed up
+	// if a single transaction was committed twice).
+	txdb.Closed = true
+	if db.Parent == nil {
+		db.ActiveTx--
+		// If at this point there are no active transactions, take this
+		// opportunity to flush all the writes to storage. At the end of this
+		// operation, the db.Store will contain all the latest writes and the
+		// db.Writes & db.Deletes will be empty. Remember, this is only for the
+		// root node. Transaction nodes don't have a db.Store.
+		if db.ActiveTx == 0 {
+			db.Flush()
+		}
+	}
+
 	return nil
 }
 
 func NewInMemoryKV() KV {
 	return &DB{
-		Store: make(map[string][]byte),
+		Store:    make(map[string][]byte),
+		Writes:   make(map[string][]TSVal),
+		Deletes:  make(map[string][]int64),
+		ActiveTx: 0,
 	}
 }
