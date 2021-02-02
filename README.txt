@@ -3,3 +3,9 @@ extremely barebones, everything is literally in memory. However, over time, I'd
 love to keep hacking on this and add an on-disk persistance mechanism and a way
 to make this thing distributed. Also I wrote a few tests to make sure this thing
 kind of works.
+
+Currently, this supports:
+- Basic KV Operations
+- Transactional Reads & Writes
+- Concurrent Access
+- Sub-Transactions (Transactions within Transactions)
