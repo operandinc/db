@@ -7,5 +7,5 @@ kind of works.
 Currently, this supports:
 - Basic KV Operations
 - Transactional Reads & Writes
-- Concurrent Access
-- Sub-Transactions (Transactions within Transactions)
+- Safe Concurrent Access (Untested)
+- Nested Transactions (Transactions within Transactions)
