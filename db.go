@@ -101,7 +101,6 @@ func (db *DB) InternalGet(k string, ts *int64) ([]byte, error) {
 	db.Mutex.RLock()
 	defer db.Mutex.RUnlock()
 
-	// We are within a transaction.
 	if db.Closed {
 		return nil, ErrTxClosed
 	}
