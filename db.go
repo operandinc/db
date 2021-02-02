@@ -341,7 +341,9 @@ func (db *DB) TxCommit(kv KV) error {
 		// db.Writes & db.Deletes will be empty. Remember, this is only for the
 		// root node. Transaction nodes don't have a db.Store.
 		if db.ActiveTx == 0 {
-			db.Flush()
+			if err := db.Flush(); err != nil {
+				return err
+			}
 		}
 	}
 
