@@ -7,7 +7,7 @@ import (
 )
 
 type KV interface {
-	Get(k string, ts *int64) ([]byte, error)
+	Get(k string) ([]byte, error)
 	Put(k string, v []byte) error
 	Delete(k string) error
 	TxBegin() KV
@@ -20,7 +20,7 @@ type TSVal struct {
 }
 
 type DB struct {
-	Parent    KV
+	Parent    *DB
 	Mutex     sync.RWMutex
 	Store     map[string][]byte
 	Writes    map[string][]TSVal
@@ -34,7 +34,7 @@ func (db *DB) Now() int64 {
 
 var ErrKeyNotFound = errors.New("db: key not found")
 
-func (db *DB) Get(k string, ts *int64) ([]byte, error) {
+func (db *DB) InternalGet(k string, ts *int64) ([]byte, error) {
 	db.Mutex.RLock()
 	defer db.Mutex.RUnlock()
 	// Base case - we are the root object.
@@ -79,35 +79,57 @@ func (db *DB) Get(k string, ts *int64) ([]byte, error) {
 		return v, nil
 	}
 	// If key wasn't mutated inside this transaction, must fetch from parent.
-	return db.Parent.Get(k, &db.Timestamp)
+	return db.Parent.InternalGet(k, &db.Timestamp)
 }
 
-func (db *DB) Put(k string, v []byte) error {
-	db.Mutex.Lock()
-	defer db.Mutex.Unlock()
+func (db *DB) Get(k string) ([]byte, error) {
+	return db.InternalGet(k, nil)
+}
+
+// Requires lock to be held.
+func (db *DB) InternalPut(k string, v []byte, ts *int64) error {
 	// If we are in the root object, then we just need to update the base.
 	if db.Parent == nil {
 		db.Store[k] = v
 		return nil
 	}
+	if ts == nil {
+		now := db.Now()
+		ts = &now
+	}
 	// We need to update our transaction state to include the new update
 	// for the key/value pair. This mutation gets appended to any existing
 	// mutations already executed within this transaction.
-	db.Writes[k] = append(db.Writes[k], TSVal{Ts: db.Now(), Value: v})
+	db.Writes[k] = append(db.Writes[k], TSVal{Ts: *ts, Value: v})
+	return nil
+}
+
+func (db *DB) Put(k string, v []byte) error {
+	db.Mutex.Lock()
+	defer db.Mutex.Unlock()
+	return db.InternalPut(k, v, nil)
+}
+
+// Requires lock to be held.
+func (db *DB) InternalDelete(k string, ts *int64) error {
+	// If we are in the root object, then we just need to update the base.
+	if db.Parent == nil {
+		delete(db.Store, k)
+		return nil
+	}
+	if ts == nil {
+		now := db.Now()
+		ts = &now
+	}
+	// We need to update our transaction state to include the new deletion.
+	db.Deletes[k] = append(db.Deletes[k], *ts)
 	return nil
 }
 
 func (db *DB) Delete(k string) error {
 	db.Mutex.Lock()
 	defer db.Mutex.Unlock()
-	// If we are in the root object, then we just need to update the base.
-	if db.Parent == nil {
-		delete(db.Store, k)
-		return nil
-	}
-	// We need to update our transaction state to include the new deletion.
-	db.Deletes[k] = append(db.Deletes[k], db.Now())
-	return nil
+	return db.InternalDelete(k, nil)
 }
 
 func (db *DB) TxBegin() KV {
@@ -186,18 +208,10 @@ func (db *DB) TxCommit(kv KV) error {
 		}
 		if delts > writets {
 			// This is a delete.
-			if db.Parent == nil {
-				delete(db.Store, k)
-			} else {
-				db.Deletes[k] = append(db.Deletes[k], ts)
-			}
+			db.InternalDelete(k, &ts)
 		} else if delts < writets {
 			// This is a write.
-			if db.Parent == nil {
-				db.Store[k] = v
-			} else {
-				db.Writes[k] = append(db.Writes[k], TSVal{Ts: ts, Value: v})
-			}
+			db.InternalPut(k, v, &ts)
 		} else {
 			// delts = writets meaning the key was written to and deleted
 			// at the same time, we cannot resolve this thus should return
